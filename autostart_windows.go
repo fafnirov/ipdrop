@@ -15,7 +15,8 @@ const (
 )
 
 // installAutostart прописывает запуск приложения при входе в Windows,
-// сохраняя выбранные порт и папку приёма.
+// сохраняя выбранные порт и папку приёма. Стартует в фоновом режиме (без окна),
+// чтобы при входе не выскакивало окно — панель открывается по двойному клику.
 func installAutostart(cfg config) error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -23,7 +24,7 @@ func installAutostart(cfg config) error {
 	}
 
 	// Команда автозапуска с теми же настройками, что и сейчас.
-	cmd := fmt.Sprintf(`"%s" -port %d -dir "%s"`, exe, cfg.port, cfg.saveDir)
+	cmd := fmt.Sprintf(`"%s" -headless -port %d -dir "%s"`, exe, cfg.port, cfg.saveDir)
 
 	key, _, err := registry.CreateKey(registry.CURRENT_USER, runKeyPath, registry.SET_VALUE)
 	if err != nil {
@@ -52,4 +53,15 @@ func uninstallAutostart() error {
 		return err
 	}
 	return nil
+}
+
+// autostartEnabled сообщает, прописан ли автозапуск сейчас.
+func autostartEnabled() bool {
+	key, err := registry.OpenKey(registry.CURRENT_USER, runKeyPath, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer key.Close()
+	_, _, err = key.GetStringValue(runValue)
+	return err == nil
 }

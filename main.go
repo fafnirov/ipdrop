@@ -5,6 +5,9 @@
 // «Домой» — и дальше отправляете фото/файлы одним тапом, без сканирования.
 // Работает по Wi-Fi в пределах одной сети.
 //
+// По умолчанию открывается окно-панель (через WebView2). Флаг -headless запускает
+// приём в фоне без окна (используется для автозапуска при входе в Windows).
+//
 // Это НЕ настоящий AirDrop (протокол AWDL закрыт Apple и на Windows недоступен),
 // а открытый аналог в духе LocalSend, который реально работает на Windows.
 package main
@@ -16,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -27,13 +31,14 @@ import (
 const stableHost = "ipdrop"
 
 func main() {
+	attachParentConsole() // показать вывод, если запущено из терминала
 	cfg := parseFlags()
 
 	// Команды установки/удаления автозапуска не запускают сервер.
 	switch {
 	case cfg.installAutostart:
 		mustOK(installAutostart(cfg))
-		fmt.Println("✓ Автозапуск включён. IpDrop будет стартовать при входе в Windows.")
+		fmt.Println("✓ Автозапуск включён. IpDrop будет стартовать в фоне при входе в Windows.")
 		return
 	case cfg.uninstallAutostart:
 		mustOK(uninstallAutostart())
@@ -45,66 +50,79 @@ func main() {
 		log.Fatalf("не удалось создать папку для приёма %q: %v", cfg.saveDir, err)
 	}
 
-	ip := lanIP()
-	ipURL := fmt.Sprintf("http://%s:%d", ip, cfg.port)
-	stableURL := fmt.Sprintf("http://%s.local:%d", stableHost, cfg.port)
+	// Пытаемся занять порт. Кто первый занял — поднимает сервер;
+	// второй запуск (например, двойной клик при работающем фоне) просто
+	// откроет окно, подключённое к уже работающему экземпляру.
+	ln, bindErr := net.Listen("tcp", fmt.Sprintf(":%d", cfg.port))
+	primary := bindErr == nil
 
-	// Публикуем постоянное имя ipdrop.local (необязательно — если не выйдет,
-	// продолжаем работать по IP-адресу).
-	mdnsOK := true
-	if stop, err := startMDNS(cfg.port, ip); err != nil {
-		log.Printf("mDNS не запустился (адрес ipdrop.local будет недоступен): %v", err)
-		mdnsOK = false
-	} else {
-		defer stop()
+	if primary {
+		ip := lanIP()
+
+		mdnsOK := false
+		if stop, err := startMDNS(cfg.port, ip); err == nil {
+			mdnsOK = true
+			defer stop()
+		} else {
+			log.Printf("mDNS не запустился (адрес ipdrop.local недоступен): %v", err)
+		}
+
+		srv := newServer(cfg, ip, mdnsOK)
+		httpServer := &http.Server{
+			Handler:           srv,
+			ReadHeaderTimeout: 15 * time.Second,
+			// Без общего ReadTimeout/WriteTimeout — иначе большие видео обрываются.
+		}
+
+		if cfg.headless {
+			printBanner(srv)
+			if err := httpServer.Serve(ln); err != nil {
+				log.Fatalf("сервер остановлен: %v", err)
+			}
+			return
+		}
+
+		// Режим с окном: сервер работает в фоне, пока открыто окно панели.
+		go func() {
+			if err := httpServer.Serve(ln); err != nil {
+				log.Printf("сервер остановлен: %v", err)
+			}
+		}()
+	} else if cfg.headless {
+		log.Fatalf("IpDrop уже запущен (порт %d занят).", cfg.port)
 	}
 
-	// QR ведёт на постоянный адрес, чтобы значок на «Домой» пережил смену IP.
-	// Если mDNS недоступен — на обычный IP-адрес.
-	qrURL := stableURL
-	if !mdnsOK {
-		qrURL = ipURL
-	}
-
-	printBanner(cfg, stableURL, ipURL, qrURL, mdnsOK)
-
-	httpServer := &http.Server{
-		Addr:              fmt.Sprintf(":%d", cfg.port),
-		Handler:           newServer(cfg),
-		ReadHeaderTimeout: 15 * time.Second,
-		// Без общего ReadTimeout/WriteTimeout — иначе большие видео обрываются.
-	}
-	if err := httpServer.ListenAndServe(); err != nil {
-		log.Fatalf("сервер остановлен: %v", err)
+	// --- Режим с окном ---
+	runtime.LockOSThread() // WebView2 должен жить на главном потоке
+	panelURL := fmt.Sprintf("http://127.0.0.1:%d/panel", cfg.port)
+	if !openWindow(panelURL) {
+		// WebView2 недоступен — открываем панель в браузере.
+		openBrowser(panelURL)
+		if primary {
+			log.Printf("Окно недоступно, панель открыта в браузере: %s", panelURL)
+			select {} // держим процесс живым, чтобы приём продолжал работать
+		}
 	}
 }
 
-// printBanner выводит инструкцию и QR-код прямо в консоль,
-// чтобы можно было сразу навести камеру телефона.
-func printBanner(cfg config, stableURL, ipURL, qrURL string, mdnsOK bool) {
+// printBanner выводит инструкцию и QR-код в консоль (фоновый режим).
+func printBanner(srv *server) {
 	line := strings.Repeat("─", 54)
 	fmt.Println(line)
-	fmt.Println("  📥  IpDrop запущен")
+	fmt.Println("  📥  IpDrop запущен (фоновый режим)")
 	fmt.Println(line)
-	if mdnsOK {
-		fmt.Printf("  Постоянный адрес (для значка) : %s\n", stableURL)
-		fmt.Printf("  Запасной по IP                : %s\n", ipURL)
+	if srv.mdns {
+		fmt.Printf("  Постоянный адрес (для значка) : %s\n", srv.networkURL())
+		fmt.Printf("  Запасной по IP                : http://%s:%d\n", srv.ip, srv.cfg.port)
 	} else {
-		fmt.Printf("  Адрес для телефона : %s\n", ipURL)
+		fmt.Printf("  Адрес для телефона : %s\n", srv.networkURL())
 	}
-	fmt.Printf("  Папка приёма       : %s\n", cfg.saveDir)
-	fmt.Println(line)
-	fmt.Println("  1) На iPhone откройте «Камеру» и наведите на QR-код.")
-	fmt.Println("  2) На странице нажмите «Поделиться» → «На экран Домой» —")
-	fmt.Println("     появится значок IpDrop, сканировать больше не нужно.")
+	fmt.Printf("  Папка приёма       : %s\n", srv.cfg.saveDir)
 	fmt.Println(line)
 
-	if qr, err := qrcode.New(qrURL, qrcode.Medium); err == nil {
+	if qr, err := qrcode.New(srv.networkURL(), qrcode.Medium); err == nil {
 		fmt.Println(qr.ToSmallString(false))
 	}
-
-	fmt.Println("  (При первом запуске Windows спросит про брандмауэр —")
-	fmt.Println("   разрешите доступ для «Частных сетей».)")
 	fmt.Println("  Остановить: Ctrl+C")
 	fmt.Println(line)
 }
@@ -120,7 +138,6 @@ func lanIP() string {
 			return a.IP.String()
 		}
 	}
-	// Запасной вариант: перебор интерфейсов.
 	if addrs, err := net.InterfaceAddrs(); err == nil {
 		for _, addr := range addrs {
 			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
